@@ -1,0 +1,42 @@
+version: '3.8'
+
+volumes:
+  HNG-nginx-logs:
+  nextcloud-data:
+  nextcloud-db:
+
+services:
+  nginx:
+    image: nginx:alpine
+    container_name: hng-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - HNG-nginx-logs:/var/log/nginx
+    depends_on:
+      - nextcloud
+
+  nextcloud:
+    image: kefaslungu/hng-nextcloud
+    container_name: hng-nextcloud
+    restart: unless-stopped
+    volumes:
+      - nextcloud-data:/var/www/html
+      - HNG-nginx-logs:/var/log/nginx:ro
+    expose:
+      - "80"
+
+  detector:
+    build: ./detector
+    container_name: hng-detector
+    restart: unless-stopped
+    network_mode: host           # needed for iptables on host
+    cap_add:
+      - NET_ADMIN                # needed to run iptables
+    volumes:
+      - HNG-nginx-logs:/var/log/nginx:ro
+      - ./detector/config.yaml:/app/config.yaml:ro
+      - ./audit.log:/app/audit.log
+   

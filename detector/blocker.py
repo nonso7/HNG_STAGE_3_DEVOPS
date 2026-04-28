@@ -1,72 +1,127 @@
-import ipaddress
-import logging
+"""
+blocker.py — Manages iptables DROP rules for banned IPs.
+
+Concept: When an IP is flagged, we shell out to iptables to insert a DROP rule.
+This blocks packets at the kernel level before they ever reach Nginx.
+"""
+
 import subprocess
 import threading
 import time
+import ipaddress
 
 
 class Blocker:
-    """Applies and tracks IP blocks via iptables (or a noop backend for tests)."""
-
-    def __init__(self, cfg: dict):
-        self.backend = cfg.get("backend", "iptables")
-        self.chain = cfg.get("chain", "DDOS_BLOCK")
-        self.ban_duration = cfg["ban_duration_seconds"]
-        self.whitelist = [ipaddress.ip_network(c) for c in cfg.get("whitelist", [])]
-        self.active: dict[str, dict] = {}
+    def __init__(self, config, audit_logger):
+        self.config = config
+        self.audit = audit_logger
+        # Active bans: {ip: {'ban_time': float, 'duration': int, 'offense_count': int, 'reason': str}}
+        self.bans = {}
+        # Track total offenses per IP across the lifetime of the daemon
+        # so backoff escalates correctly even after an unban.
+        self.offense_count = {}
         self.lock = threading.Lock()
-        self.log = logging.getLogger("blocker")
-        self._ensure_chain()
+        self.whitelist = self._build_whitelist()
 
-    def _ensure_chain(self):
-        if self.backend != "iptables":
-            return
+    def _build_whitelist(self):
+        """Parse whitelist into a list of ip_network objects for fast checking."""
+        nets = []
+        for entry in self.config.get('whitelist', []):
+            try:
+                # Handles both single IPs ("127.0.0.1") and CIDR ("172.17.0.0/16").
+                if '/' not in entry:
+                    entry = entry + '/32'
+                nets.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                continue
+        return nets
+
+    def is_whitelisted(self, ip):
         try:
-            subprocess.run(["iptables", "-N", self.chain], check=False, capture_output=True)
-            subprocess.run(["iptables", "-C", "INPUT", "-j", self.chain], check=True, capture_output=True)
-        except subprocess.CalledProcessError:
-            subprocess.run(["iptables", "-I", "INPUT", "-j", self.chain], check=False, capture_output=True)
-        except FileNotFoundError:
-            self.log.warning("iptables not found; falling back to noop backend")
-            self.backend = "noop"
+            addr = ipaddress.ip_address(ip)
+            return any(addr in net for net in self.whitelist)
+        except ValueError:
+            return True   # malformed IP — don't ban
 
-    def _is_whitelisted(self, ip: str) -> bool:
-        addr = ipaddress.ip_address(ip)
-        return any(addr in net for net in self.whitelist)
+    def ban(self, ip, reason, current_rate, baseline_mean):
+        """Add an iptables DROP rule and record the ban."""
+        if self.is_whitelisted(ip):
+            print(f"[blocker] Skipping whitelisted IP {ip}")
+            return None
 
-    def block(self, ip: str, reason: str) -> bool:
-        if self._is_whitelisted(ip):
-            return False
         with self.lock:
-            if ip in self.active:
+            if ip in self.bans:
+                return None  # already banned
+
+            # Determine offense level for backoff schedule.
+            offense = self.offense_count.get(ip, 0)
+            durations = self.config['ban_durations']
+            duration = durations[min(offense, len(durations) - 1)]
+
+            # Insert iptables rule.
+            try:
+                subprocess.run(
+                    ['iptables', '-I', 'INPUT', '-s', ip, '-j', 'DROP'],
+                    check=True, capture_output=True, timeout=5,
+                )
+            except subprocess.CalledProcessError as e:
+                print(f"[blocker] iptables failed: {e.stderr.decode()}")
+                return None
+
+            self.bans[ip] = {
+                'ban_time': time.time(),
+                'duration': duration,
+                'offense_count': offense + 1,
+                'reason': reason,
+                'rate_at_ban': current_rate,
+                'baseline_at_ban': baseline_mean,
+            }
+            self.offense_count[ip] = offense + 1
+
+            self.audit.log(
+                'BAN', ip=ip, condition=reason,
+                rate=f"{current_rate:.1f}", baseline=f"{baseline_mean:.1f}",
+                duration=f"{duration}s" if duration > 0 else "permanent",
+            )
+            return self.bans[ip]
+
+    def unban(self, ip):
+        """Remove iptables rule and the ban record."""
+        with self.lock:
+            if ip not in self.bans:
                 return False
-            self.active[ip] = {"reason": reason, "ts": time.time()}
-        if self.backend == "iptables":
-            subprocess.run(
-                ["iptables", "-A", self.chain, "-s", ip, "-j", "DROP"],
-                check=False, capture_output=True,
+            try:
+                subprocess.run(
+                    ['iptables', '-D', 'INPUT', '-s', ip, '-j', 'DROP'],
+                    check=True, capture_output=True, timeout=5,
+                )
+            except subprocess.CalledProcessError:
+                # Rule may already be gone; log but continue.
+                pass
+
+            ban_info = self.bans.pop(ip)
+            self.audit.log(
+                'UNBAN', ip=ip,
+                duration_served=f"{int(time.time() - ban_info['ban_time'])}s",
             )
-        self.log.info("blocked %s (%s)", ip, reason)
-        return True
+            return True
 
-    def unblock(self, ip: str) -> bool:
+    def list_bans(self):
+        """Return current bans with remaining time."""
         with self.lock:
-            entry = self.active.pop(ip, None)
-        if entry is None:
-            return False
-        if self.backend == "iptables":
-            subprocess.run(
-                ["iptables", "-D", self.chain, "-s", ip, "-j", "DROP"],
-                check=False, capture_output=True,
-            )
-        self.log.info("unblocked %s", ip)
-        return True
-
-    def expired(self) -> list[str]:
-        now = time.time()
-        with self.lock:
-            return [ip for ip, e in self.active.items() if now - e["ts"] >= self.ban_duration]
-
-    def list_blocks(self) -> list[dict]:
-        with self.lock:
-            return [{"ip": ip, **e} for ip, e in self.active.items()]
+            now = time.time()
+            result = []
+            for ip, info in self.bans.items():
+                if info['duration'] < 0:
+                    remaining = "permanent"
+                else:
+                    elapsed = now - info['ban_time']
+                    remaining = max(0, int(info['duration'] - elapsed))
+                result.append({
+                    'ip': ip,
+                    'reason': info['reason'],
+                    'banned_at': info['ban_time'],
+                    'duration': info['duration'],
+                    'remaining': remaining,
+                })
+            return result

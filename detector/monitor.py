@@ -1,56 +1,56 @@
-import logging
-import re
+"""
+monitor.py — Tails the Nginx JSON access log line by line.
+
+Concept: We open the log file, seek to its end, and yield each new line as
+it appears. This works just like `tail -f` in the shell. When Nginx rotates
+the log (renaming it and creating a new file), we detect the inode change
+and reopen the file so we don't miss events.
+"""
+
+import os
 import time
-from pathlib import Path
-
-LOG_PATTERN = re.compile(
-    r'(?P<ip>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] '
-    r'"(?P<method>\S+) (?P<path>\S+) \S+" '
-    r'(?P<status>\d+) (?P<size>\d+)'
-)
+import json
 
 
-class Monitor:
-    """Tails the nginx access log and feeds parsed events to baseline + detector."""
+def tail_log(filepath):
+    """
+    Generator that yields parsed JSON events from the log file.
+    Yields one dict per log line. Skips malformed lines silently.
+    """
+    # Wait for the file to exist (Nginx may not have created it yet).
+    while not os.path.exists(filepath):
+        print(f"[monitor] Waiting for log file {filepath} ...")
+        time.sleep(1)
 
-    def __init__(self, log_path: str):
-        self.log_path = Path(log_path)
-        self.log = logging.getLogger("monitor")
+    # Open the file and remember its inode so we can detect rotation.
+    f = open(filepath, 'r')
+    f.seek(0, 2)  # seek to end of file - 2 means SEEK_END
+    inode = os.fstat(f.fileno()).st_ino
 
-    def _tail(self, stop_event):
-        while not stop_event.is_set():
-            if not self.log_path.exists():
-                self.log.warning("log file %s missing; retrying", self.log_path)
-                time.sleep(2)
-                continue
-            with self.log_path.open() as f:
-                f.seek(0, 2)
-                while not stop_event.is_set():
-                    line = f.readline()
-                    if not line:
-                        time.sleep(0.2)
-                        continue
-                    yield line.rstrip("\n")
+    print(f"[monitor] Tailing {filepath} (inode {inode})")
 
-    def run(self, stop_event, baseline, detector):
-        for line in self._tail(stop_event):
-            event = self.parse(line)
-            if event is None:
-                continue
-            baseline.record(event)
-            detector.record(event)
+    while True:
+        line = f.readline()
+        if not line:
+            # No new data right now — sleep briefly to avoid pegging the CPU.
+            time.sleep(0.1)
 
-    @staticmethod
-    def parse(line: str):
-        m = LOG_PATTERN.match(line)
-        if not m:
-            return None
-        d = m.groupdict()
-        return {
-            "ip": d["ip"],
-            "ts": time.time(),
-            "method": d["method"],
-            "path": d["path"],
-            "status": int(d["status"]),
-            "size": int(d["size"]),
-        }
+            # Check if the file was rotated (inode changed) or truncated.
+            try:
+                if os.stat(filepath).st_ino != inode:
+                    print("[monitor] Log rotated, reopening")
+                    f.close()
+                    f = open(filepath, 'r')
+                    inode = os.fstat(f.fileno()).st_ino
+            except FileNotFoundError:
+                # File momentarily gone during rotation — wait for it back.
+                time.sleep(1)
+            continue
+
+        # Parse JSON. If it fails (partial line, malformed), skip silently.
+        try:
+            event = json.loads(line.strip())
+            yield event
+        except json.JSONDecodeError:
+            # Malformed line — log to stderr but keep going.
+            continue

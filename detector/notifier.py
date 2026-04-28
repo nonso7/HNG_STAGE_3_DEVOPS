@@ -1,35 +1,56 @@
-import logging
+"""
+notifier.py — Sends alerts to Slack via Incoming Webhook.
 
+Posts are fire-and-forget on a background thread to avoid blocking detection.
+"""
+
+import threading
 import requests
-
-SEVERITY_ORDER = {"info": 0, "warning": 1, "critical": 2}
+from datetime import datetime
 
 
 class Notifier:
-    """Sends alerts to a webhook (Slack/Discord-compatible JSON payload)."""
+    def __init__(self, webhook_url):
+        self.webhook_url = webhook_url
 
-    def __init__(self, cfg: dict):
-        self.enabled = cfg.get("enabled", False)
-        self.webhook_url = cfg.get("webhook_url", "")
-        self.min_severity = cfg.get("min_severity", "warning")
-        self.log = logging.getLogger("notifier")
+    def _post(self, text):
+        """Background-thread-friendly POST that swallows errors."""
+        def _do():
+            try:
+                requests.post(self.webhook_url, json={'text': text}, timeout=5)
+            except Exception as e:
+                print(f"[notifier] Slack post failed: {e}")
+        threading.Thread(target=_do, daemon=True).start()
 
-    def send(self, severity: str, message: str) -> bool:
-        if not self.enabled:
-            self.log.info("[%s] %s", severity, message)
-            return False
-        if SEVERITY_ORDER.get(severity, 0) < SEVERITY_ORDER.get(self.min_severity, 0):
-            return False
-        if not self.webhook_url:
-            self.log.warning("notifier enabled but no webhook_url configured")
-            return False
-        try:
-            requests.post(
-                self.webhook_url,
-                json={"text": f"[{severity.upper()}] {message}"},
-                timeout=5,
-            )
-            return True
-        except requests.RequestException:
-            self.log.exception("failed to deliver notification")
-            return False
+    def send_ban(self, ip, reason, rate, baseline, duration):
+        ts = datetime.utcnow().isoformat() + 'Z'
+        dur = f"{duration}s" if duration > 0 else "permanent"
+        text = (
+            f":no_entry: *IP BANNED* `{ip}`\n"
+            f"• Condition: {reason}\n"
+            f"• Current rate: {rate:.1f} req/s\n"
+            f"• Baseline: {baseline:.1f} req/s\n"
+            f"• Ban duration: {dur}\n"
+            f"• Time: {ts}"
+        )
+        self._post(text)
+
+    def send_unban(self, ip, duration_served):
+        ts = datetime.utcnow().isoformat() + 'Z'
+        text = (
+            f":white_check_mark: *IP UNBANNED* `{ip}`\n"
+            f"• Duration served: {duration_served}s\n"
+            f"• Time: {ts}"
+        )
+        self._post(text)
+
+    def send_global_alert(self, reason, rate, baseline):
+        ts = datetime.utcnow().isoformat() + 'Z'
+        text = (
+            f":rotating_light: *GLOBAL ANOMALY*\n"
+            f"• Condition: {reason}\n"
+            f"• Current rate: {rate:.1f} req/s\n"
+            f"• Baseline: {baseline:.1f} req/s\n"
+            f"• Time: {ts}"
+        )
+        self._post(text)

@@ -1,0 +1,22 @@
+# Secrets — never commit these
+detector/config.yaml
+*.pem
+*.key
+.env
+
+# Logs and runtime data
+audit.log
+*.log
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
