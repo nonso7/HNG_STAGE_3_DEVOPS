@@ -9,7 +9,8 @@ import subprocess
 import threading
 import time
 import ipaddress
-
+import json
+import os
 
 class Blocker:
     def __init__(self, config, audit_logger):
@@ -22,6 +23,32 @@ class Blocker:
         self.offense_count = {}
         self.lock = threading.Lock()
         self.whitelist = self._build_whitelist()
+        self.persistence_path = '/app/logs/bans.json'
+        self._load_bans()
+
+    def _load_bans(self):
+        """Restore bans from disk on startup."""
+        if not os.path.exists(self.persistence_path):
+            return
+        try:
+            with open(self.persistence_path) as f:
+                data = json.load(f)
+            self.bans = data.get('bans', {})
+            self.offense_count = data.get('offense_count', {})
+            print(f"[blocker] Restored {len(self.bans)} ban(s) from disk")
+        except Exception as e:
+            print(f"[blocker] Could not load bans: {e}")
+
+    def _save_bans(self):
+        """Persist current bans to disk."""
+        try:
+            with open(self.persistence_path, 'w') as f:
+                json.dump({
+                    'bans': self.bans,
+                    'offense_count': self.offense_count,
+                }, f)
+        except Exception as e:
+            print(f"[blocker] Could not save bans: {e}")
 
     def _build_whitelist(self):
         """Parse whitelist into a list of ip_network objects for fast checking."""
@@ -83,6 +110,7 @@ class Blocker:
                 rate=f"{current_rate:.1f}", baseline=f"{baseline_mean:.1f}",
                 duration=f"{duration}s" if duration > 0 else "permanent",
             )
+            self._save_bans()
             return self.bans[ip]
 
     def unban(self, ip):
@@ -104,6 +132,7 @@ class Blocker:
                 'UNBAN', ip=ip,
                 duration_served=f"{int(time.time() - ban_info['ban_time'])}s",
             )
+            self._save_bans()
             return True
 
     def list_bans(self):

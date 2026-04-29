@@ -6,7 +6,7 @@ detector/config.yaml
 
 # Logs and runtime data
 audit.log
-*.log
+logs/
 
 # Python artifacts
 __pycache__/

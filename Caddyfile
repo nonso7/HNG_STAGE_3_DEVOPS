@@ -1,0 +1,13 @@
+# Dashboard — HTTPS with auto Let's Encrypt
+hngstage3.chickenkiller.com {
+    # Caddy is on the docker bridge network with the detector
+    # but detector uses network_mode: host, so we reach it via
+    # the docker host's gateway address
+    reverse_proxy 172.17.0.1:8080
+}
+
+# Nextcloud — accessible by IP only (per the brief)
+# Port 80 catches direct IP hits (no Host header match for the domain above)
+:80 {
+    reverse_proxy nginx:80
+}
